@@ -50,6 +50,31 @@ static inline void init_type(struct type *type, struct spa_type_map *map)
 	spa_type_monitor_map(map, &type->monitor);
 }
 
+struct device {
+	struct spa_list link;
+	struct spa_list card_link;
+
+	struct card *card;
+
+	int num;
+	int direction;
+	bool enabled;
+};
+
+struct card {
+	struct spa_list link;
+
+	struct impl *impl;
+
+	struct udev_device *dev;
+
+	int num;
+	char name[16];
+	snd_ctl_t *ctl_hndl;
+
+	struct spa_list devices;
+};
+
 struct impl {
 	struct spa_handle handle;
 	struct spa_monitor monitor;
@@ -63,30 +88,17 @@ struct impl {
 	void *callbacks_data;
 
 	struct udev *udev;
-	struct udev_monitor *umonitor;
-	struct udev_enumerate *enumerate;
-	uint32_t index;
-	struct udev_list_entry *devices;
-
-	snd_ctl_t *ctl_hndl;
-	struct udev_device *dev;
-	char card_name[16];
-	int dev_idx;
-	int stream_idx;
-
 	int fd;
 	struct spa_source source;
+	struct udev_monitor *umonitor;
+	uint32_t index;
+	struct device *current;
+
+	struct spa_list cards;
+	struct spa_list devices;
+
+	snd_hctl_t *hctl_hndl;
 };
-
-static int impl_udev_open(struct impl *this)
-{
-	if (this->udev != NULL)
-		return 0;
-
-	this->udev = udev_new();
-
-	return 0;
-}
 
 static const char *path_get_card_id(const char *path)
 {
@@ -105,15 +117,30 @@ static const char *path_get_card_id(const char *path)
 }
 
 static int
-fill_item(struct impl *this, snd_ctl_card_info_t *card_info, snd_pcm_info_t *dev_info, struct udev_device *dev,
-		struct spa_pod **item, struct spa_pod_builder *builder)
+fill_item(struct impl *this,
+	  struct device *device,
+	  snd_ctl_card_info_t *card_info,
+	  struct spa_pod **item,
+	  struct spa_pod_builder *builder)
 {
 	const char *str, *name, *klass = NULL;
 	const struct spa_handle_factory *factory = NULL;
 	char card_name[64];
+	int err;
 	struct type *t = &this->type;
+	struct card *card = device->card;
+	struct udev_device *dev = card->dev;
+	snd_pcm_info_t *dev_info;
 
-	switch (snd_pcm_info_get_stream(dev_info)) {
+	snd_pcm_info_alloca(&dev_info);
+	snd_pcm_info_set_device(dev_info, device->num);
+	snd_pcm_info_set_subdevice(dev_info, 0);
+	snd_pcm_info_set_stream(dev_info, device->direction);
+
+	if ((err = snd_ctl_pcm_info(card->ctl_hndl, dev_info)) < 0)
+		return err;
+
+	switch (device->direction) {
 	case SND_PCM_STREAM_PLAYBACK:
 		factory = &spa_alsa_sink_factory;
 		klass = "Audio/Sink";
@@ -123,7 +150,7 @@ fill_item(struct impl *this, snd_ctl_card_info_t *card_info, snd_pcm_info_t *dev
 		klass = "Audio/Source";
 		break;
 	default:
-		return -1;
+		return -EINVAL;
 	}
 
 	name = udev_device_get_property_value(dev, "ID_MODEL_FROM_DATABASE");
@@ -136,7 +163,7 @@ fill_item(struct impl *this, snd_ctl_card_info_t *card_info, snd_pcm_info_t *dev
 	if (!(name && *name))
 		name = "Unknown";
 
-	snprintf(card_name, 64, "%s,%d", this->card_name, snd_pcm_info_get_device(dev_info));
+	snprintf(card_name, 64, "%s,%d", card->name, device->num);
 
 	spa_pod_builder_add(builder,
 		"<", 0, t->monitor.MonitorItem,
@@ -216,88 +243,220 @@ fill_item(struct impl *this, snd_ctl_card_info_t *card_info, snd_pcm_info_t *dev
 	return 0;
 }
 
-static void close_card(struct impl *this)
-{
-	if (this->ctl_hndl)
-		snd_ctl_close(this->ctl_hndl);
-	this->ctl_hndl = NULL;
-}
-
-static int open_card(struct impl *this, struct udev_device *dev)
+#if 0
+static int load_hctls(struct impl *this)
 {
 	int err;
-	const char *str;
+	snd_hctl_elem_t *elem;
 
-	if (this->ctl_hndl)
+	if ((err = snd_hctl_open(&this->hctl_hndl, this->card_name, 0)) < 0) {
+		spa_log_warn(this->log, "can't open hcontrol for card %s: %s", this->card_name, snd_strerror(err));
 		return 0;
-
-	if (udev_device_get_property_value(dev, "PULSE_IGNORE"))
-		return -1;
-
-	if ((str = udev_device_get_property_value(dev, "SOUND_CLASS")) && strcmp(str, "modem") == 0)
-		return -1;
-
-	if ((str = path_get_card_id(udev_device_get_property_value(dev, "DEVPATH"))) == NULL)
-		return -1;
-
-	snprintf(this->card_name, 16, "hw:%s", str);
-
-	if ((err = snd_ctl_open(&this->ctl_hndl, this->card_name, 0)) < 0) {
-		spa_log_error(this->log, "can't open control for card %s: %s", this->card_name, snd_strerror(err));
-		return err;
 	}
-	this->dev_idx = -1;
-	this->stream_idx = -1;
+
+	if ((err = snd_hctl_load(this->hctl_hndl)) < 0) {
+		spa_log_warn(this->log, "can't load hcontrol for card %s: %s", this->card_name, snd_strerror(err));
+		return 0;
+	}
+
+	for (elem = snd_hctl_first_elem(this->hctl_hndl); elem != NULL;
+	     elem = snd_hctl_elem_next(elem)) {
+
+		snd_ctl_elem_info_t *info;
+		snd_ctl_elem_value_t *val;
+
+		snd_ctl_elem_info_alloca(&info);
+
+		if (snd_hctl_elem_info(elem, info) < 0)
+			continue;
+
+		spa_log_info(this->log, "control %s %d %d %d",
+				snd_hctl_elem_get_name(elem),
+				snd_ctl_elem_info_get_type(info),
+				snd_ctl_elem_info_get_interface(info),
+				snd_hctl_elem_get_subdevice(elem));
+
+		if (snd_ctl_elem_info_get_interface(info) != SND_CTL_ELEM_IFACE_CARD)
+			continue;
+
+		snd_ctl_elem_value_alloca(&val);
+		if (snd_hctl_elem_read(elem, val) < 0)
+			continue;
+
+		if (snd_ctl_elem_info_get_type(info) == SND_CTL_ELEM_TYPE_BOOLEAN) {
+			spa_log_info(this->log, " bool %d", snd_ctl_elem_value_get_boolean(val, 0));
+		}
+		else if (snd_ctl_elem_info_get_type(info) == SND_CTL_ELEM_TYPE_INTEGER)  {
+			spa_log_info(this->log, " int %d", snd_ctl_elem_value_get_boolean(val, 0));
+		}
+	}
+
+
+
+	return err;
+}
+#endif
+
+static int create_device(struct impl *this,
+			 struct udev_device *dev,
+			 struct card *card,
+			 snd_ctl_card_info_t *card_info,
+			 snd_pcm_info_t *dev_info,
+			 int dev_num,
+			 int direction)
+{
+	struct device *device;
+
+	device = calloc(1, sizeof(struct device));
+	if (device == NULL)
+		return -ENOMEM;
+
+	device->card = card;
+	device->num = dev_num;
+	device->direction = direction;
+
+	spa_list_append(&this->devices, &device->link);
+	spa_list_append(&card->devices, &device->card_link);
 
 	return 0;
 }
 
-static int get_next_device(struct impl *this, struct udev_device *dev,
-			   struct spa_pod **item, struct spa_pod_builder *builder)
+static void free_device(struct device *device)
 {
-	int err;
-	snd_pcm_info_t *dev_info;
+	spa_list_remove(&device->link);
+	spa_list_remove(&device->card_link);
+
+	free(device);
+}
+
+static struct card * find_card(struct impl *this, int card_num)
+{
+	struct card *c;
+
+	spa_list_for_each(c, &this->cards, link)
+		if (c->num == card_num)
+			return c;
+
+	return NULL;
+}
+
+static int check_card(struct impl *this, struct udev_device *dev, int *card_num)
+{
+	const char *str, *devpath;
+
+	if (udev_device_get_property_value(dev, "PULSE_IGNORE"))
+		return 0;
+
+	if ((str = udev_device_get_property_value(dev, "SOUND_CLASS")) && strcmp(str, "modem") == 0)
+		return 0;
+
+	if ((devpath = udev_device_get_devpath(dev)) == NULL)
+		return 0;
+
+	if ((str = path_get_card_id(devpath)) == NULL)
+		return 0;
+
+	*card_num = atoi(str);
+
+	return 1;
+}
+
+static struct card * create_card(struct impl *this, struct udev_device *dev)
+{
+	struct card *card;
+	int card_num, err, dev_num;
 	snd_ctl_card_info_t *card_info;
+	snd_pcm_info_t *dev_info;
 
-	if (this->stream_idx == -1) {
-	      next_device:
-		if ((err = snd_ctl_pcm_next_device(this->ctl_hndl, &this->dev_idx)) < 0) {
-			spa_log_error(this->log, "error iterating devices: %s", snd_strerror(err));
-			return err;
-		}
-		if (this->dev_idx < 0)
-			return -1;
+	if (!check_card(this, dev, &card_num))
+		return NULL;
 
-		this->stream_idx = 0;
+	card = find_card(this, card_num);
+	if (card != NULL)
+		return NULL;
+
+	card = calloc(1, sizeof(struct card));
+	if (card == 0)
+		return NULL;
+
+	spa_list_init(&card->devices);
+
+	card->num = card_num;
+	card->dev = dev;
+	snprintf(card->name, sizeof(card->name), "hw:%u", card_num);
+
+	spa_list_append(&this->cards, &card->link);
+
+	if ((err = snd_ctl_open(&card->ctl_hndl, card->name, 0)) < 0) {
+		spa_log_error(this->log, "can't open control for card %s: %s",
+				card->name, snd_strerror(err));
+		return NULL;
+	}
+	snd_ctl_card_info_alloca(&card_info);
+
+	if ((err = snd_ctl_card_info(card->ctl_hndl, card_info)) < 0) {
+		spa_log_error(this->log, "can't get card info for device: %s", snd_strerror(err));
+		return NULL;
 	}
 
 	snd_pcm_info_alloca(&dev_info);
-	snd_pcm_info_set_device(dev_info, this->dev_idx);
-	snd_pcm_info_set_subdevice(dev_info, 0);
 
-      again:
-	switch (this->stream_idx++) {
-	case 0:
+	dev_num = -1;
+	while (true) {
+		if ((err = snd_ctl_pcm_next_device(card->ctl_hndl, &dev_num)) < 0) {
+			spa_log_error(this->log, "error iterating devices: %s", snd_strerror(err));
+			return NULL;
+		}
+		if (dev_num < 0)
+			break;
+
+		snd_pcm_info_set_device(dev_info, dev_num);
+		snd_pcm_info_set_subdevice(dev_info, 0);
+
 		snd_pcm_info_set_stream(dev_info, SND_PCM_STREAM_PLAYBACK);
-		break;
-	case 1:
+
+		if ((err = snd_ctl_pcm_info(card->ctl_hndl, dev_info)) == 0) {
+			if ((err = create_device(this,
+						 dev,
+						 card,
+						 card_info,
+						 dev_info,
+						 dev_num,
+						 SND_PCM_STREAM_PLAYBACK)) < 0)
+				continue;
+		}
+
 		snd_pcm_info_set_stream(dev_info, SND_PCM_STREAM_CAPTURE);
-		break;
-	default:
-		goto next_device;
+
+		if ((err = snd_ctl_pcm_info(card->ctl_hndl, dev_info)) == 0) {
+			if ((err = create_device(this,
+						 dev,
+						 card,
+						 card_info,
+						 dev_info,
+						 dev_num,
+						 SND_PCM_STREAM_CAPTURE)) < 0)
+				continue;
+		}
 	}
 
-	snd_ctl_card_info_alloca(&card_info);
+	return card;
+}
 
-	if ((err = snd_ctl_card_info(this->ctl_hndl, card_info)) < 0) {
-		spa_log_error(this->log, "can't get card info for device: %s", snd_strerror(err));
-		return err;
-	}
+static int remove_card(struct impl *this, struct card *card)
+{
+	struct device *d, *t;
 
-	if ((err = snd_ctl_pcm_info(this->ctl_hndl, dev_info)) < 0)
-		goto again;
+	spa_list_for_each_safe(d, t, &card->devices, card_link)
+		free_device(d);
 
-	return fill_item(this, card_info, dev_info, dev, item, builder);
+	spa_list_remove(&card->link);
+
+	if (card->ctl_hndl)
+		snd_ctl_close(card->ctl_hndl);
+	free(card);
+
+	return 0;
 }
 
 static void impl_on_fd_events(struct spa_source *source)
@@ -306,6 +465,13 @@ static void impl_on_fd_events(struct spa_source *source)
 	struct udev_device *dev;
 	const char *action;
 	uint32_t type;
+	struct spa_event *event;
+	uint8_t buffer[4096];
+	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+	struct card *card;
+	struct device *d;
+	snd_ctl_card_info_t *card_info;
+	int card_num;
 
 	dev = udev_monitor_receive_device(this->umonitor);
 
@@ -321,22 +487,65 @@ static void impl_on_fd_events(struct spa_source *source)
 	} else
 		return;
 
-	if (open_card(this, dev) < 0)
+	if (type == this->type.monitor.Added ||
+	    type == this->type.monitor.Changed) {
+		card = create_card(this, dev);
+	}
+	else {
+		if (!check_card(this, dev, &card_num))
+			return;
+
+		card = find_card(this, card_num);
+	}
+	if (card == NULL)
 		return;
 
-	while (true) {
-		uint8_t buffer[4096];
-		struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-		struct spa_event *event;
+	snd_ctl_card_info_alloca(&card_info);
+	if (snd_ctl_card_info(card->ctl_hndl, card_info) < 0)
+		return;
+
+	spa_list_for_each(d, &card->devices, card_link) {
 		struct spa_pod *item;
 
 		event = spa_pod_builder_object(&b, 0, type);
-		if (get_next_device(this, dev, &item, &b) < 0)
-			break;
+
+		fill_item(this, d, card_info, &item, &b);
 
 		this->callbacks->event(this->callbacks_data, event);
 	}
-	close_card(this);
+
+	if (type == this->type.monitor.Removed)
+		remove_card(this, card);
+}
+
+static int impl_udev_open(struct impl *this)
+{
+	struct udev_enumerate *enumerate;
+        struct udev_list_entry *devices, *d;
+
+
+	if (this->udev != NULL)
+		return 0;
+
+	this->udev = udev_new();
+
+	enumerate = udev_enumerate_new(this->udev);
+
+	udev_enumerate_add_match_subsystem(enumerate, "sound");
+	udev_enumerate_scan_devices(enumerate);
+
+	devices = udev_enumerate_get_list_entry(enumerate);
+
+	udev_list_entry_foreach(d, devices) {
+		const char *path = udev_list_entry_get_name(d);
+		struct udev_device *dev = udev_device_new_from_syspath(this->udev, path);
+
+		create_card(this, dev);
+	}
+
+        udev_enumerate_unref(enumerate);
+
+	return 0;
 }
 
 static int
@@ -362,7 +571,7 @@ impl_monitor_set_callbacks(struct spa_monitor *monitor,
 			udev_monitor_unref(this->umonitor);
 		this->umonitor = udev_monitor_new_from_netlink(this->udev, "udev");
 		if (this->umonitor == NULL)
-			return -ENODEV;
+			return -ENOMEM;
 
 		udev_monitor_filter_add_match_subsystem_devtype(this->umonitor, "sound", NULL);
 		udev_monitor_enable_receiving(this->umonitor);
@@ -387,6 +596,8 @@ static int impl_monitor_enum_items(struct spa_monitor *monitor,
 {
 	int res;
 	struct impl *this;
+	struct device *device;
+	snd_ctl_card_info_t *card_info;
 
 	spa_return_val_if_fail(monitor != NULL, -EINVAL);
 	spa_return_val_if_fail(item != NULL, -EINVAL);
@@ -397,42 +608,25 @@ static int impl_monitor_enum_items(struct spa_monitor *monitor,
 		return res;
 
 	if (*index == 0 || this->index > *index) {
-		if (this->enumerate)
-			udev_enumerate_unref(this->enumerate);
-		this->enumerate = udev_enumerate_new(this->udev);
-
-		udev_enumerate_add_match_subsystem(this->enumerate, "sound");
-		udev_enumerate_scan_devices(this->enumerate);
-
-		this->devices = udev_enumerate_get_list_entry(this->enumerate);
+		this->current = spa_list_first(&this->devices, struct device, link);
 		this->index = 0;
 	}
-	while (*index > this->index && this->devices) {
-		this->devices = udev_list_entry_get_next(this->devices);
+
+	while (*index > this->index) {
+		this->current = spa_list_next(this->current, link);
 		this->index++;
 	}
-      again:
-	if (this->devices == NULL)
+	if (spa_list_is_end(this->current, &this->devices, link))
 		return 0;
 
-	if (this->dev == NULL) {
-		this->dev = udev_device_new_from_syspath(this->udev, udev_list_entry_get_name(this->devices));
+	device = this->current;
 
-		if (open_card(this, this->dev) < 0) {
-			udev_device_unref(this->dev);
-		      next:
-			this->dev = NULL;
-			this->devices = udev_list_entry_get_next(this->devices);
-			goto again;
-		}
-	}
-	if (get_next_device(this, this->dev, item, builder) < 0) {
-		udev_device_unref(this->dev);
-		close_card(this);
-		goto next;
-	}
+	snd_ctl_card_info_alloca(&card_info);
+	if ((res = snd_ctl_card_info(device->card->ctl_hndl, card_info)) < 0)
+		return res;
 
-	this->index++;
+	fill_item(this, device, card_info, item, builder);
+
 	(*index)++;
 
 	return 1;
@@ -466,10 +660,6 @@ static int impl_clear(struct spa_handle *handle)
 {
         struct impl *this = (struct impl *) handle;
 
-	if (this->dev)
-		udev_device_unref(this->dev);
-        if (this->enumerate)
-                udev_enumerate_unref(this->enumerate);
         if (this->umonitor)
                 udev_monitor_unref(this->umonitor);
         if (this->udev)
@@ -516,6 +706,8 @@ impl_init(const struct spa_handle_factory *factory,
 	init_type(&this->type, this->map);
 
 	this->monitor = impl_monitor;
+	spa_list_init(&this->cards);
+	spa_list_init(&this->devices);
 
 	return 0;
 }
@@ -537,6 +729,7 @@ impl_enum_interface_info(const struct spa_handle_factory *factory,
 		return 0;
 
 	*info = &impl_interfaces[(*index)++];
+
 	return 1;
 }
 
